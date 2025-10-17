@@ -1,0 +1,105 @@
+#!/bin/bash
+# This script setup the S3 storage to test the application.
+# This script is intended to be run from the devcontainer
+# shellcheck disable=SC2312
+
+DATA_DIR=${DATA_DIR:-"/tmp/zfs2s3"}
+
+#######################################
+#                 S3                  #
+#######################################
+
+# Check if garage is running and stop it if necessary
+if pgrep -x "garage" > /dev/null; then
+    echo "Garage server is already running. Stopping it..."
+    pkill -x "garage"
+    sleep 2
+fi
+
+# Create garage configuration file
+GARAGE_CONFIG_PATH="/etc/garage.toml"
+rm -f "${GARAGE_CONFIG_PATH}"
+rm -rf "${DATA_DIR}/garage"
+mkdir -p "$(dirname "${GARAGE_CONFIG_PATH}")"
+mkdir -p "${DATA_DIR}/garage/meta"
+mkdir -p "${DATA_DIR}/garage/data"
+mkdir -p "${DATA_DIR}/garage/snapshots"
+
+cat > "${GARAGE_CONFIG_PATH}" <<EOF
+metadata_dir = "${DATA_DIR}/garage/meta"
+data_dir = "${DATA_DIR}/garage/data"
+metadata_snapshots_dir = "${DATA_DIR}/garage/snapshots"
+db_engine = "sqlite"
+
+replication_factor = 1
+
+rpc_bind_addr = "[::]:3901"
+rpc_public_addr = "127.0.0.1:3901"
+rpc_secret = "$(openssl rand -hex 32)"
+
+[s3_api]
+s3_region = "garage"
+api_bind_addr = "[::]:3900"
+root_domain = ".s3.garage.localhost"
+
+[s3_web]
+bind_addr = "[::]:3902"
+root_domain = ".web.garage.localhost"
+index = "index.html"
+
+[k2v_api]
+api_bind_addr = "[::]:3904"
+
+[admin]
+api_bind_addr = "[::]:3903"
+admin_token = "$(openssl rand -base64 32)"
+metrics_token = "$(openssl rand -base64 32)"
+EOF
+
+# Launch Garage server in background and save the log to a file
+garage -c "${GARAGE_CONFIG_PATH}" server > "${DATA_DIR}/garage/garage.log" 2>&1 &
+echo "Garage server is starting... (log: ${DATA_DIR}/garage/garage.log)"
+
+# Wait for the server to start
+until garage status > /dev/null 2>&1; do
+    sleep 1
+done
+echo "Garage server is running."
+
+# Create layout
+LAYOUT_SIZE=${LAYOUT_SIZE:-"1G"}
+NODE_ID="$(garage status |  awk '/HEALTHY NODES/ {getline; getline; print $1}' | tr -d '\r\n')"
+garage layout assign -z 'garage' -c "${LAYOUT_SIZE}" "${NODE_ID}"
+garage layout apply --version 1
+
+# Create bucket
+BUCKET_NAME=${BUCKET_NAME:-"backup"}
+garage bucket create "${BUCKET_NAME}"
+
+# Generate S3 credentials
+API_KEY_NAME="api-key"
+API_KEY_INFO="$(garage key create api-key)"
+API_KEY_ID="$(echo "${API_KEY_INFO}" | awk '/Key ID:/ {print $3}' | tr -d '\r\n')"
+API_KEY="$(echo "${API_KEY_INFO}" | awk '/Secret key:/ {print $3}' | tr -d '\r\n')"
+
+# Assign permissions to the API key
+garage bucket allow \
+    --read \
+    --write \
+    --owner \
+    "${BUCKET_NAME}" \
+    --key "${API_KEY_NAME}"
+
+# Output AWS S3 compatible environment variables
+AWS_ACCESS_KEY_ID="${API_KEY_ID}"
+AWS_SECRET_ACCESS_KEY=${API_KEY}
+AWS_DEFAULT_REGION='garage'
+AWS_ENDPOINT_URL='http://localhost:3900'
+
+echo ""
+echo "Export the following environment variables to use S3 storage:"
+echo "-----------------------------------------------"
+echo "AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}"
+echo "AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}"
+echo "AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}"
+echo "AWS_ENDPOINT_URL: ${AWS_ENDPOINT_URL}"

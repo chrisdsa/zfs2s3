@@ -1,0 +1,39 @@
+#!/bin/bash
+# This script creates the ZFS volume if it doesn't exist, writes random data to it,
+# and verifies the data integrity by comparing SHA256 hashes.
+# When the volume already exists, it will overwrite the data.
+
+if [ -z "$1" ] || [ -z "$2" ]; then
+    echo "Usage: $0 <zfs_volume_name> <zfs_volume_size_in_MB>"
+    exit 1
+fi
+ZFS_VOL_NAME=$1
+ZFS_VOL_SIZE=$2
+ZFS_POOL_NAME=${ZFS_POOL_NAME:-"zfs2s3pool"}
+DEV="/dev/zvol/${ZFS_POOL_NAME}/${ZFS_VOL_NAME}"
+
+# If the volume doesn't exist, create it
+if ! zfs list "${ZFS_POOL_NAME}/${ZFS_VOL_NAME}" &> /dev/null; then
+    zfs create -V "${ZFS_VOL_SIZE}M" "${ZFS_POOL_NAME}/${ZFS_VOL_NAME}"
+    zfs set volmode=dev "${ZFS_POOL_NAME}/${ZFS_VOL_NAME}"
+fi
+sleep 1
+
+# Write data to the zvol and verify it
+# Generate random data
+RAND_FILE="${DATA_DIR}/rand-file-${ZFS_VOL_NAME}.bin"
+dd if=/dev/urandom of="${RAND_FILE}" bs=1M count="${ZFS_VOL_SIZE}" status=none
+sync
+
+# Write the random data to the zvol
+dd if="${RAND_FILE}" of="${DEV}" bs=1M oflag=direct conv=fsync status=none
+sync
+
+# Verify by comparing hashes of the entire volume
+FILE_SHA="$(sha256sum "${RAND_FILE}" | awk '{print $1}')"
+DEV_SHA="$(dd if="${DEV}" bs=1M count="${ZFS_VOL_SIZE}" status=none | sha256sum | awk '{print $1}')"
+
+if [ "${FILE_SHA}" != "${DEV_SHA}" ]; then
+    echo "Data integrity check failed: hashes do not match!"
+    exit 1
+fi

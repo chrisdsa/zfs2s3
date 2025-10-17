@@ -1,0 +1,29 @@
+#!/bin/bash
+# This script setup the ZFS storage to test the application.
+# This script is intended to be run from the devcontainer.
+# shellcheck disable=SC2312
+
+DATA_DIR=${DATA_DIR:-"/tmp/zfs2s3"}
+mkdir -p "${DATA_DIR}"
+
+#######################################
+#                 ZFS                 #
+#######################################
+
+ZFS_DISK_SIZE=${ZFS_DISK_SIZE:-"1024"} # Size in MB
+ZFS_DISK_NAME=${ZFS_DISK_NAME:-"zfs.img"}
+ZFS_POOL_NAME=${ZFS_POOL_NAME:-"zfs2s3pool"}
+
+# Delete pool if it exists
+if zpool list | grep -q "^${ZFS_POOL_NAME} "; then
+    echo "Deleting existing ZFS pool..."
+    zpool destroy "${ZFS_POOL_NAME}"
+fi
+
+# Create the disk
+dd if=/dev/zero of="${DATA_DIR}/${ZFS_DISK_NAME}" bs=1M count="${ZFS_DISK_SIZE}" status=none
+
+# Create ZFS pool
+zpool create "${ZFS_POOL_NAME}" "${DATA_DIR}/${ZFS_DISK_NAME}"
+
+echo "ZFS pool: ${ZFS_POOL_NAME}"
