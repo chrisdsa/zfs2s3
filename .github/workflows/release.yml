@@ -1,0 +1,55 @@
+name: Release
+run-name: Release
+on: workflow_dispatch
+
+permissions:
+  contents: write
+
+env:
+  GIT_SHA: ${{ github.sha }}
+
+jobs:
+  create_linux_executable:
+    runs-on: ubuntu-latest
+    container:
+      image: rust:trixie
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install target
+        run: rustup target add x86_64-unknown-linux-gnu
+
+      - name: Build
+        run: cargo build --target x86_64-unknown-linux-gnu --release
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release_linux_${{ github.ref_name }}
+          path: target/x86_64-unknown-linux-gnu/release/zfs2s3
+          retention-days: 1
+
+
+  create_release:
+    runs-on: ubuntu-latest
+    needs:
+      - create_linux_executable
+    steps:
+      - name: Download linux artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release_linux_${{ github.ref_name }}
+          path: release_linux
+
+      - name: Make binary executable
+        run: chmod +x release_linux/zfs2s3
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release_linux/zfs2s3
+          tag_name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          token: ${{ secrets.GITHUB_TOKEN }}

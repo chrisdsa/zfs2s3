@@ -1,0 +1,386 @@
+#!/bin/bash
+# zfs2s3 tests suite using shunit2.
+
+# Variables
+DATA_DIR=${DATA_DIR:-"/tmp/zfs2s3"}
+ZFS_DISK_NAME=${ZFS_DISK_NAME:-"zfs.img"}
+ZFS_POOL_NAME=${ZFS_POOL_NAME:-"zfs2s3pool"}
+BUCKET_NAME=${BUCKET_NAME:-"backup"}
+
+# Build
+BUILD_TYPE=${BUILD_TYPE:-"release"}
+
+# Default configuration
+DEFAULT_CONFIG='
+[backup]
+schedule = " */10 * * * * * *"
+incremental = "*/2 * * * * * *"
+volumes = ["zfs2s3pool/vm-*", "zfs2s3pool/ct-*"]
+
+[cleanup]
+schedule = "*/10 * * * * * *"
+keep_min = 3
+keep_duration = "30 sec"
+
+[s3]
+bucket = "backup"
+url = "http://localhost:3900"
+region = "garage"
+'
+
+CONF_FILE="${DATA_DIR}/zfs2s3.conf"
+
+# Compute the checksum of a ZFS volume/snapshot
+# Usage: zfsVolumeChecksum <volume>
+zfsVolumeChecksum() {
+    local volume
+    volume="$1"
+
+    # verify dataset/snapshot exists
+    if ! zfs list -H "$volume" >/dev/null 2>&1; then
+        echo "dataset not found: $volume" >&2
+        return 1
+    fi
+
+    # compute sha256 of the snapshot stream
+    if ! sum=$(zfs send "$volume" | sha256sum | awk '{print $1}'); then
+        echo "failed to compute checksum for: $volume" >&2
+        return 2
+    fi
+
+    printf '%s\n' "$sum"
+}
+
+# Get the latest full snapshot for a given ZFS volume
+# Usage: zfsGetLatestFullSnapshot <volume>
+zfsGetLatestFullSnapshot() {
+    local volume
+    volume="$1"
+
+    # Get the latest full snapshot for the given volume
+    # Full snapshots do not have 'incremental' in their names
+    local snapshot
+    snapshot=$(zfs list -H -o name -t snapshot -S creation | grep "^${volume}@" | grep -v "incremental" | head -n 1)
+
+    # Return the snapshot name without the pool prefix
+    echo "${snapshot#"${ZFS_POOL_NAME}"/}"
+}
+
+# Get the latest snapshot for a given ZFS volume
+# Usage: zfsGetLatestSnapshot <volume>
+zfsGetLatestSnapshot() {
+    local volume
+    volume="$1"
+
+    # Get the latest snapshot for the given volume
+    local snapshot
+    snapshot=$(zfs list -H -o name -t snapshot -S creation | grep "^${volume}@" | head -n 1)
+
+    # Return the snapshot name without the pool prefix
+    echo "${snapshot#"${ZFS_POOL_NAME}"/}"
+}
+
+# Restore backup from S3 to local ZFS volume
+# Usage: restoreSnapshot <remote_snapshot> <local_volume>
+restoreSnapshot() {
+    local remote_snapshot
+    remote_snapshot="$1"
+    local local_volume
+    local_volume="$2"
+
+    # Receive the snapshot from S3 and restore it to the local ZFS volume
+    aws s3api get-object \
+    --bucket "${BUCKET_NAME}" \
+    --key "${remote_snapshot}" \
+    --endpoint-url http://localhost:3900 \
+    /dev/stdout | zfs receive -F "${local_volume}"
+}
+
+# Delete snapshot on S3
+# Usage: deleteSnapshotOnS3 <remote_snapshot>
+deleteSnapshotOnS3() {
+    local remote_snapshot
+    remote_snapshot="$1"
+
+    aws s3 rm "s3://${BUCKET_NAME}/${remote_snapshot}" --endpoint-url http://localhost:3900 > /dev/null 2>&1
+}
+
+# Assert S3 can restore the last full snapshot correctly
+# Usage: assertLastFullSnapshot <volume>
+assertLastFullSnapshot() {
+    local vol_name
+    vol_name="$1"
+
+    # Verify the integrity of the backup by comparing checksums
+    local snapshot_name
+    snapshot_name=$(zfsGetLatestFullSnapshot "${ZFS_POOL_NAME}/${vol_name}")
+
+    # Save original volume checksum
+    local original_checksum
+    original_checksum=$(zfsVolumeChecksum "${ZFS_POOL_NAME}/${snapshot_name}")
+
+    # Destroy the volume to simulate data loss
+    zfs destroy -r "${ZFS_POOL_NAME}/${vol_name}" > /dev/null 2>&1
+
+    # Restore the backup
+    local backup_checksum
+    backup_checksum=$(restoreSnapshot "${snapshot_name}" "${ZFS_POOL_NAME}/${vol_name}" && \
+                      zfsVolumeChecksum "${ZFS_POOL_NAME}/${snapshot_name}")
+
+    assertEquals "Backup checksum does not match original!" "${original_checksum}" "${backup_checksum}"
+}
+
+assertIncrementalSnapshot() {
+    local vol_name
+    vol_name="$1"
+
+    # Verify the integrity of the backup by comparing checksums
+    local snapshot_name
+    snapshot_name=$(zfsGetLatestSnapshot "${ZFS_POOL_NAME}/${vol_name}")
+
+    # Save original volume checksum
+    local original_checksum
+    original_checksum=$(zfsVolumeChecksum "${ZFS_POOL_NAME}/${snapshot_name}")
+
+    # Save incremental snapshot name until we reach the full snapshot
+    local backup_snapshots=()
+    local snapshot
+    snapshot=${snapshot_name}
+    while [[ "${snapshot}" == *"incremental"* ]]; do
+        backup_snapshots+=("${snapshot}")
+        zfs destroy "${ZFS_POOL_NAME}/${snapshot}" > /dev/null 2>&1
+        snapshot=$(zfsGetLatestSnapshot "${ZFS_POOL_NAME}/${vol_name}")
+    done
+
+    # Then add the full snapshot
+    snapshot=$(zfsGetLatestFullSnapshot "${ZFS_POOL_NAME}/${vol_name}")
+    backup_snapshots+=("${snapshot}")
+
+    # Destroy the volume to simulate data loss
+    zfs destroy -r "${ZFS_POOL_NAME}/${vol_name}" > /dev/null 2>&1
+
+    # Restore the backup
+    # Start with the full snapshot then move up all the incremental snapshots
+    for ((i=${#backup_snapshots[@]}-1; i>=0; i--)); do
+        restoreSnapshot "${backup_snapshots[$i]}" "${ZFS_POOL_NAME}/${vol_name}"
+    done
+
+    local backup_checksum
+    backup_checksum=$(zfsVolumeChecksum "${ZFS_POOL_NAME}/${snapshot_name}")
+
+    assertEquals "Backup checksum does not match original!" "${original_checksum}" "${backup_checksum}"
+}
+
+assertVolumeDoesNotExistOnS3() {
+    local vol_name
+    vol_name="$1"
+
+    # Check if any snapshot for the given volume exists on S3
+    volumes=$(aws s3 ls "${BUCKET_NAME}" --endpoint-url http://localhost:3900 | awk '{print $4}' | cut -d'@' -f1 | sort | uniq)
+    if grep -qF -- "${vol_name}" <<< "$volumes"; then
+        fail "Volume ${vol_name} exists on S3, but it should not!"
+    fi
+}
+
+# Setup and Teardown
+oneTimeSetUp() {
+    # Create ZFS pool
+    ./tests/setup_zfs > /dev/null 2>&1
+
+    # Create S3 storage
+    local s3_data
+    s3_data=$(./tests/setup_s3)
+
+    AWS_ACCESS_KEY_ID="$(echo "${s3_data}" | awk '/AWS_ACCESS_KEY_ID:/ {print $2}' | tr -d '\r\n')"
+    AWS_SECRET_ACCESS_KEY="$(echo "${s3_data}" | awk '/AWS_SECRET_ACCESS_KEY:/ {print $2}' | tr -d '\r\n')"
+    AWS_DEFAULT_REGION="$(echo "${s3_data}" | awk '/AWS_DEFAULT_REGION:/ {print $2}' | tr -d '\r\n')"
+    AWS_ENDPOINT_URL="$(echo "${s3_data}" | awk '/AWS_ENDPOINT_URL:/ {print $2}' | tr -d '\r\n')"
+
+    export AWS_ACCESS_KEY_ID
+    export AWS_SECRET_ACCESS_KEY
+    export AWS_DEFAULT_REGION
+    export AWS_ENDPOINT_URL
+    export S3_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID}"
+    export S3_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY}"
+    export S3_REGION="${AWS_DEFAULT_REGION}"
+    export S3_ENDPOINT_URL="${AWS_ENDPOINT_URL}"
+}
+
+oneTimeTearDown() {
+    # Teardown S3 storage
+    pkill garage
+
+    # Teardown ZFS pool
+    if zpool list | grep -q "^${ZFS_POOL_NAME} "; then
+        zpool destroy "${ZFS_POOL_NAME}"  > /dev/null 2>&1
+    fi
+    rm -f "${DATA_DIR}/${ZFS_DISK_NAME}"
+}
+
+setUp() {
+    # Create config file
+    echo "${DEFAULT_CONFIG}" > "${CONF_FILE}"
+}
+
+tearDown() {
+    # Teardown ZFS pool between tests
+    if zpool list | grep -q "^${ZFS_POOL_NAME} "; then
+        zfs destroy -r "${ZFS_POOL_NAME}"  > /dev/null 2>&1
+    fi
+
+    # Empty bucket
+    if  aws s3 ls "s3://${BUCKET_NAME}" > /dev/null 2>&1; then
+        aws s3 rm "s3://${BUCKET_NAME}" --recursive > /dev/null 2>&1
+    fi
+}
+
+# Tests
+testBackupSingleVolumes() {
+    # Create a single volume
+    local vol_name
+    vol_name="vm-disk-1001"
+    ./tests/zfs_volume "${vol_name}" 10
+
+    # Backup the volume
+    ./target/"${BUILD_TYPE}"/zfs2s3 --single-shot full -c "${CONF_FILE}"
+
+    # Verify the integrity of the backup by comparing checksums
+    assertLastFullSnapshot "${vol_name}"
+}
+
+testBackupSingleVolumesIncrementalBackup() {
+    # Create a single volume
+    local vol_name
+    vol_name="vm-disk-1001"
+    ./tests/zfs_volume "${vol_name}" 10
+
+    # Test
+    ./target/"${BUILD_TYPE}"/zfs2s3 --single-shot full -c "${CONF_FILE}"
+    ./tests/zfs_volume "${vol_name}" 10 # Modify the volume
+
+    ./target/"${BUILD_TYPE}"/zfs2s3 --single-shot incremental -c "${CONF_FILE}"
+    ./tests/zfs_volume "${vol_name}" 10 # Modify the volume
+
+    ./target/"${BUILD_TYPE}"/zfs2s3 --single-shot incremental -c "${CONF_FILE}"
+
+    # Verify the integrity of the backup by comparing checksums
+    assertIncrementalSnapshot "${vol_name}"
+}
+
+testBackupMultipleVolumes() {
+    # Create a multiples volumes
+    local vol_name
+    vol_name=("vm-disk-1001" "ct-disk-2001" "data-disk-1001")
+    for name in "${vol_name[@]}"; do
+        ./tests/zfs_volume "${name}" 10
+    done
+
+    # Backup the volumes
+    ./target/"${BUILD_TYPE}"/zfs2s3 --single-shot full -c "${CONF_FILE}"
+
+    # Assert
+    assertVolumeDoesNotExistOnS3 "data-disk-1001"
+    assertLastFullSnapshot "vm-disk-1001"
+    assertLastFullSnapshot "ct-disk-2001"
+}
+
+testUploadToS3Failed() {
+    # Create a multiples volumes
+    local vol_name
+    vol_name=("vm-disk-1001" "ct-disk-2001" "data-disk-1001")
+    for name in "${vol_name[@]}"; do
+        ./tests/zfs_volume "${name}" 10
+    done
+
+    # Backup the volumes
+    ./target/"${BUILD_TYPE}"/zfs2s3 --single-shot full -c "${CONF_FILE}"
+    for name in "${vol_name[@]}"; do
+        ./tests/zfs_volume "${name}" 5 # Modify the volumes
+    done
+
+    ./target/"${BUILD_TYPE}"/zfs2s3 --single-shot incremental -c "${CONF_FILE}"
+    for name in "${vol_name[@]}"; do
+        ./tests/zfs_volume "${name}" 5 # Modify the volumes
+    done
+
+    # Will delete this snapshot on S3 to simulate an issue.
+    local snapshot_failure
+    snapshot_failure=$(zfsGetLatestSnapshot "${ZFS_POOL_NAME}/vm-disk-1001")
+
+    ./target/"${BUILD_TYPE}"/zfs2s3 --single-shot incremental -c "${CONF_FILE}"
+    for name in "${vol_name[@]}"; do
+        ./tests/zfs_volume "${name}" 5 # Modify the volumes
+    done
+
+    deleteSnapshotOnS3 "${snapshot_failure}"
+
+    # Test
+    ./target/"${BUILD_TYPE}"/zfs2s3 --single-shot incremental -c "${CONF_FILE}"
+
+    # Assert
+    assertVolumeDoesNotExistOnS3 "data-disk-1001"
+    assertIncrementalSnapshot "ct-disk-2001"
+    assertIncrementalSnapshot "vm-disk-1001"
+}
+
+testInvalidConfig() {
+    # Wrong cron syntax, some fields are missing.
+    local invalid_config='
+[backup]
+schedule = " */20 * * * * *"
+incremental = "*/2 * * * * * *"
+volumes = ["zfs2s3pool/vm-*", "zfs2s3pool/ct-*"]
+
+[cleanup]
+schedule = "*/10 * * * * * *"
+keep_duration = "30 sec"
+
+[s3]
+url = "http://localhost:3900"
+region = "garage"
+'
+
+    # Setup config file
+    rm -f "${CONF_FILE}"
+    echo "${invalid_config}" > "${CONF_FILE}"
+
+    # Test
+    ./target/"${BUILD_TYPE}"/zfs2s3 --single-shot full -c "${CONF_FILE}"
+    exit_code=$?
+
+    assertNotEquals "Command must fail on invalid config." 0 "${exit_code}"
+}
+
+testScheduleAndCleanUp() {
+    # Create a single volume
+    local vol_name
+    vol_name="vm-disk-1001"
+    ./tests/zfs_volume "${vol_name}" 5
+
+    # Make a full backup before starting the scheduled backups
+    RUST_LOG=info ./target/"${BUILD_TYPE}"/zfs2s3 --single-shot full -c "${CONF_FILE}"
+
+    # Test
+    local now
+    now=$(date +%s)
+    RUST_LOG=info ./target/"${BUILD_TYPE}"/zfs2s3 -c "${CONF_FILE}" &
+    local zfs2s3_pid
+    zfs2s3_pid=$!
+    sleep 55
+    kill -TERM "${zfs2s3_pid}"
+    wait "${zfs2s3_pid}"
+
+    # Assert there are at most 3 full snapshots
+    local full_snapshot_count
+    full_snapshot_count=$(aws s3 ls "s3://${BUCKET_NAME}" --endpoint-url http://localhost:3900 | awk '{print $4}' | grep "^vm-disk-1001@" | grep -v "incremental" |  grep -c "^vm-disk-1001@")
+    assertTrue "Expected 3 full snapshots to exist on S3" "[[ ${full_snapshot_count} -eq 3 ]]"
+
+    # Manual assert for now, list all snapshots on S3 and zfs
+    echo "Test started at: $(date -d @"${now}" +"%Y-%m-%d %H:%M:%S")"
+    echo "Snapshots on S3:"
+    aws s3 ls "s3://${BUCKET_NAME}" --endpoint-url http://localhost:3900 | awk '{print $4}'
+    echo "Snapshots on ZFS:"
+    zfs list -t snapshot -o name -H
+}
+
+. shunit2
