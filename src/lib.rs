@@ -241,23 +241,3 @@ fn is_incremental_snapshot(snapshot_name: &str) -> bool {
 fn format_iso_8601(t: &DateTime<Utc>) -> String {
     t.format(TIMESTAMP_FORMAT).to_string()
 }
-
-// fn parse_iso_8601(timestamp_str: &str) -> Result<DateTime<Utc>, chrono::ParseError> {
-//     NaiveDateTime::parse_from_str(timestamp_str, TIMESTAMP_FORMAT).map(|ndt| ndt.and_utc())
-// }
-
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//
-//     #[test]
-//     fn test_timestamp_parsing() {
-//         // We work with seconds precision
-//         let now = DateTime::<Utc>::from_timestamp_secs(Utc::now().timestamp()).unwrap();
-//
-//         let test_timestamp = format_iso_8601(&now);
-//         let parsed_timestamp = parse_iso_8601(&test_timestamp);
-//
-//         assert_eq!(parsed_timestamp, Ok(now));
-//     }
-// }

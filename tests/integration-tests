@@ -23,6 +23,7 @@ volumes = ["zfs2s3pool/vm-*", "zfs2s3pool/ct-*"]
 schedule = "*/10 * * * * * *"
 keep_min = 3
 keep_duration = "30 sec"
+exclude = ["**/*@__base__*"]
 
 [s3]
 bucket = "backup"
@@ -362,6 +363,9 @@ testScheduleAndCleanUp() {
     # Make a full backup before starting the scheduled backups
     RUST_LOG=info ./target/"${BUILD_TYPE}"/zfs2s3 --single-shot full -c "${CONF_FILE}"
 
+    # Create a __base__ snapshot to be excluded from cleanup
+    zfs snapshot "${ZFS_POOL_NAME}/${vol_name}@__base__"
+
     # Test
     local now
     now=$(date +%s)
@@ -372,10 +376,15 @@ testScheduleAndCleanUp() {
     kill -TERM "${zfs2s3_pid}"
     wait "${zfs2s3_pid}"
 
-    # Assert there are at most 3 full snapshots
+    # Assert there are 4 full snapshots
     local full_snapshot_count
     full_snapshot_count=$(aws s3 ls "s3://${BUCKET_NAME}" --endpoint-url http://localhost:3900 | awk '{print $4}' | grep "^vm-disk-1001@" | grep -v "incremental" |  grep -c "^vm-disk-1001@")
-    assertTrue "Expected 3 full snapshots to exist on S3" "[[ ${full_snapshot_count} -eq 3 ]]"
+    assertTrue "Expected 4 full snapshots to exist on S3" "[[ ${full_snapshot_count} -eq 4 ]]"
+
+    # Assert the __base__ snapshot still exists
+    if ! zfs list -H -o name -t snapshot | grep -q "^${ZFS_POOL_NAME}/${vol_name}@__base__$"; then
+        fail "__base__ snapshot was deleted but it should not have been!"
+    fi
 
     # Manual assert for now, list all snapshots on S3 and zfs
     echo "Test started at: $(date -d @"${now}" +"%Y-%m-%d %H:%M:%S")"
