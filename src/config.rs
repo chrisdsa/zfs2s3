@@ -101,6 +101,9 @@ pub struct CleanupPolicy {
     /// older than the full snapshot are also deleted.
     /// E.g. "90d" for 90 days, "12w" for 12 weeks, "18m" for 18 months
     keep_duration: String,
+    /// Snapshots to exclude from cleanup based on glob patterns
+    #[serde(default)]
+    pub exclude: Vec<String>,
 }
 
 impl CleanupPolicy {

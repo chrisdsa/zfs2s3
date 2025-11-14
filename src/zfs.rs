@@ -76,6 +76,19 @@ impl VolumeSnapshotMap {
         config: &Config,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         for (_, snapshots) in self.volumes.iter_mut() {
+            // Save all snapshots that should be excluded from cleanup
+            let excluded_snapshots: Vec<Snapshot> = snapshots
+                .iter()
+                .filter(|s| {
+                    config
+                        .cleanup
+                        .exclude
+                        .iter()
+                        .any(|pattern| glob_match(pattern, &s.name))
+                })
+                .cloned()
+                .collect();
+
             // Find the index of the first full snapshot that can be considered for deletion
             if let Some((start, _)) = snapshots
                 .iter()
@@ -103,6 +116,13 @@ impl VolumeSnapshotMap {
 
                 snapshots.truncate(cutoff_index);
             }
+
+            // Re-add excluded snapshots if not already present
+            excluded_snapshots.iter().for_each(|s| {
+                if !snapshots.iter().any(|existing| existing.name == s.name) {
+                    snapshots.push(s.clone());
+                }
+            });
         }
 
         sync_snapshots(self).await?;
@@ -154,7 +174,7 @@ impl Snapshot {
     }
 
     pub fn to_key(&self) -> Result<&str, Box<dyn std::error::Error + Send + Sync>> {
-        match self.name.split('/').collect::<Vec<&str>>().last() {
+        match self.name.split('/').next_back() {
             Some(key) => Ok(key),
             None => Err(SnapshotError::FailedToExtractKey(self.name.clone()).into()),
         }
@@ -171,7 +191,7 @@ impl Display for ZfsError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             ZfsError::CommandError(s) => write!(f, "ZFS command error: {}", s),
-            ZfsError::ChildError => write!(f, "Failed to spawn ZFS child process"),
+            ZfsError::ChildError => write!(f, "Failed to capture stdout from ZFS child process"),
         }
     }
 }
@@ -297,14 +317,12 @@ async fn sync_snapshots(
     let snapshots = list_snapshots().await?;
 
     for snapshot in snapshots.iter() {
-        let mut found = false;
-        for volume in volumes.volumes.iter() {
-            if volume.1.iter().any(|s| s.name.eq(&snapshot.name)) {
-                found = true;
-                break;
-            }
-        }
-        if !found {
+        let exists_locally = volumes
+            .volumes
+            .values()
+            .flat_map(|v| v.iter())
+            .any(|s| s.name == snapshot.name);
+        if !exists_locally {
             delete_snapshot(&snapshot.name).await?;
         }
     }
@@ -340,5 +358,15 @@ mod test_snapshot {
         let line = "pool/dataset@snap1 invalid_timestamp";
         let result = Snapshot::try_from(line);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn exclude_glob_pattern() {
+        let snapshot = Snapshot {
+            name: "pool/vm-disk-1001@__base__".to_string(),
+            creation: Utc::now(),
+        };
+        let pattern = "**/*@__base__*";
+        assert!(glob_match(pattern, &snapshot.name));
     }
 }
