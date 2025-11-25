@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.2.2] - 2025-11-25
+### Fixed
+- Increased s3 part chunk size to be able to upload large files. Was limited to around 80GB before.
+
 ## [0.2.1] - 2025-11-25
 
 ### Fixed

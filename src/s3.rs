@@ -36,8 +36,12 @@ impl S3Client {
         mut stream: R,
         key: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        const UPLOAD_BUFFER_SIZE: usize = 8 * 1024 * 1024;
-        const MAX_CONCURRENT_UPLOADS: usize = 16;
+        // S3 multipart has an object size of max 5TB, with each part between 5MB and 5GB.
+        // The max number of parts is 10,000.
+        // Since we do not know the total size in advance, we will use a part size of 500MB to
+        // cover the max use case.
+        const UPLOAD_BUFFER_SIZE: usize = 500 * 1024 * 1024; // 500MB
+        const MAX_CONCURRENT_UPLOADS: usize = 1; // Number of concurrent uploads
 
         let upload = self.store.put_multipart(&ObjectPath::from(key)).await?;
         let mut writer = WriteMultipart::new_with_chunk_size(upload, UPLOAD_BUFFER_SIZE);
