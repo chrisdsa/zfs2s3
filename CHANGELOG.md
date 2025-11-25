@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.2.1] - 2025-11-25
+
+### Fixed
+- New volumes were not being backed up unless the application was restarted
+
 ## [0.2.0] - 2025-11-14
 
 ### Added

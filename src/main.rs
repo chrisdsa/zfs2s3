@@ -5,7 +5,6 @@ use std::sync::Arc;
 use tokio::fs::read_to_string;
 use tokio::select;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
@@ -44,11 +43,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let file = read_to_string(args.config).await?;
     let config = Config::try_from(&file)?;
 
-    // Get volumes and their snapshots to back up
-    let mut volumes_to_backup = zfs2s3::zfs::VolumeSnapshotMap::new()
-        .await?
-        .keep_volume_to_backup(&config);
-
     // Get S3 client
     let s3_client = zfs2s3::s3::S3Client::new(
         &config.s3.url,
@@ -60,6 +54,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // single-shot mode?
     if let Some(mode) = args.single_shot {
+        // Get volumes and their snapshots to back up
+        let mut volumes_to_backup = zfs2s3::zfs::VolumeSnapshotMap::new()
+            .await?
+            .keep_volume_to_backup(&config);
+
         zfs2s3::snapshot_volumes(&volumes_to_backup, &mode).await?;
         volumes_to_backup.refresh().await?;
 
@@ -73,7 +72,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Schedules
     let config = Arc::new(config);
     let s3_client = Arc::new(s3_client);
-    let volumes_to_backup = Arc::new(Mutex::new(volumes_to_backup));
     let cancel_token = CancellationToken::new();
     let mut handles: Vec<JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>> =
         Vec::new();
@@ -89,7 +87,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let handle_full_backups = tokio::task::spawn(run_scheduled_backups(
         Arc::clone(&config),
         Arc::clone(&s3_client),
-        Arc::clone(&volumes_to_backup),
         cancel_token.clone(),
     ));
     handles.push(handle_full_backups);
@@ -99,7 +96,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         run_cleanup(
             Arc::clone(&config),
             Arc::clone(&s3_client),
-            Arc::clone(&volumes_to_backup),
             cancel_token.clone(),
         )
     });
@@ -130,7 +126,6 @@ async fn shutdown_signal() {
 async fn run_scheduled_backups(
     config: Arc<Config>,
     s3_client: Arc<zfs2s3::s3::S3Client>,
-    volumes: Arc<Mutex<zfs2s3::zfs::VolumeSnapshotMap>>,
     cancel_token: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Run both Full and Incremental schedules in the same task to avoid having
@@ -167,7 +162,9 @@ async fn run_scheduled_backups(
         }
 
         // Get volumes to back up
-        let mut volumes = volumes.lock().await;
+        let mut volumes = zfs2s3::zfs::VolumeSnapshotMap::new()
+            .await?
+            .keep_volume_to_backup(&config);
 
         // Perform backup
         if let Err(e) = zfs2s3::snapshot_volumes(&volumes, &snapshot_type).await {
@@ -184,8 +181,6 @@ async fn run_scheduled_backups(
         if let Err(e) = zfs2s3::sync_snapshots(&s3_client, &volumes).await {
             log::error!("Failed to sync snapshots to S3: {e}");
         }
-
-        drop(volumes);
     }
 
     Ok(())
@@ -194,7 +189,6 @@ async fn run_scheduled_backups(
 async fn run_cleanup(
     config: Arc<Config>,
     s3_client: Arc<zfs2s3::s3::S3Client>,
-    volumes: Arc<Mutex<zfs2s3::zfs::VolumeSnapshotMap>>,
     cancel_token: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let schedule = config.cleanup.schedule()?;
@@ -213,7 +207,11 @@ async fn run_cleanup(
             }
         }
 
-        let mut volumes = volumes.lock().await;
+        // Get volumes to back up
+        let mut volumes = zfs2s3::zfs::VolumeSnapshotMap::new()
+            .await?
+            .keep_volume_to_backup(&config);
+
         if let Err(e) = volumes.refresh().await {
             log::error!("Failed to refresh volume snapshots: {e}");
             continue;
