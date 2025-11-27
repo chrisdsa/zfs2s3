@@ -354,14 +354,25 @@ region = "garage"
     assertNotEquals "Command must fail on invalid config." 0 "${exit_code}"
 }
 
+testIncrementalSnapshotWithoutFull() {
+    # The application creates a snapshot for volumes that do not have any.
+    # Create a single volume
+    local vol_name
+    vol_name="vm-disk-1001"
+    ./tests/zfs_volume "${vol_name}" 10
+
+    # Test
+    ./target/"${BUILD_TYPE}"/zfs2s3 --single-shot incremental -c "${CONF_FILE}"
+
+    # Assert
+    assertIncrementalSnapshot "${vol_name}"
+}
+
 testScheduleAndCleanUp() {
     # Create a single volume
     local vol_name
     vol_name="vm-disk-1001"
     ./tests/zfs_volume "${vol_name}" 5
-
-    # Make a full backup before starting the scheduled backups
-    RUST_LOG=info ./target/"${BUILD_TYPE}"/zfs2s3 --single-shot full -c "${CONF_FILE}"
 
     # Create a __base__ snapshot to be excluded from cleanup
     zfs snapshot "${ZFS_POOL_NAME}/${vol_name}@__base__"
