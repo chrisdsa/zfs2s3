@@ -67,7 +67,14 @@ impl VolumeSnapshotMap {
             .cloned()
             .collect();
         // Sort by creation time descending
-        snaps.sort_by(|a, b| b.creation.cmp(&a.creation));
+        // When they are equal, full snapshots come after incremental snapshots
+        snaps.sort_by(|a, b| {
+            b.creation.cmp(&a.creation).then_with(|| {
+                let a_inc = a.name.contains(BACKUP_SUFFIX_INCREMENTAL);
+                let b_inc = b.name.contains(BACKUP_SUFFIX_INCREMENTAL);
+                b_inc.cmp(&a_inc)
+            })
+        });
         snaps
     }
 

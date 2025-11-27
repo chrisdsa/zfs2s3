@@ -1,6 +1,16 @@
 # Changelog
 
+## [0.2.3] - 2025-11-26
+
+### Changed
+- Ensure there is a full snapshot prior to incremental snapshots.
+
+### Fixed
+- If a snapshot send failed, the application continues and sends the other snapshots.
+- Prevent cleanup from running at the same time as a backup.
+
 ## [0.2.2] - 2025-11-25
+
 ### Fixed
 - Increased s3 part chunk size to be able to upload large files. Was limited to around 80GB before.
 
@@ -18,6 +28,7 @@
 - Minor improvements to sync_snapshots, now using `flat_map`.
 
 ## [0.1.0] - 2025-11-07
+
 ### Added
 - Initial release of zfs2s3 backup application
 - ZFS snapshot handling

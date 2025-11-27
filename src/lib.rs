@@ -89,6 +89,33 @@ pub async fn snapshot_volumes(
     Ok(())
 }
 
+pub async fn ensure_snapshots_for_volumes(volumes: &VolumeSnapshotMap) -> Result<(), Zfs2S3Error> {
+    let mut errors: Vec<Box<dyn std::error::Error + Send + Sync>> = Vec::new();
+
+    for volume in &volumes.volumes {
+        // Check if there is at least one snapshot
+        let has_snapshot = volume.1.iter().any(|snapshot| {
+            snapshot.name.contains(BACKUP_SUFFIX)
+                && !snapshot.name.contains(BACKUP_SUFFIX_INCREMENTAL)
+        });
+
+        if !has_snapshot {
+            // Create a full snapshot
+            let timestamp = format_iso_8601(&Utc::now());
+            let name = format!("{}{SUFFIX_SEPARATOR}{BACKUP_SUFFIX}{timestamp}", volume.0);
+            if let Err(e) = zfs::snapshot(&name).await {
+                errors.push(e);
+            }
+        }
+    }
+
+    if !errors.is_empty() {
+        return Err(Zfs2S3Error::SnapshotFailures(errors));
+    }
+
+    Ok(())
+}
+
 /// Upload the latest snapshot of a single volume to S3
 async fn upload_single_full_snapshot_to_s3(
     s3: &S3Client,
@@ -192,9 +219,15 @@ async fn sync_missing_snapshots(
 
                 // Upload the snapshot
                 if is_incremental_snapshot(&snapshot.name) {
-                    upload_single_incremental_snapshot_to_s3(s3, volume).await?;
-                } else {
-                    upload_single_full_snapshot_to_s3(s3, volume).await?;
+                    if let Err(e) = upload_single_incremental_snapshot_to_s3(s3, volume).await {
+                        log::error!(
+                            "Failed to upload incremental snapshot {}: {}",
+                            snapshot.name,
+                            e
+                        );
+                    }
+                } else if let Err(e) = upload_single_full_snapshot_to_s3(s3, volume).await {
+                    log::error!("Failed to upload full snapshot {}: {}", snapshot.name, e);
                 }
             }
         }
@@ -227,7 +260,9 @@ async fn sync_deleted_snapshots(
         // Snapshot names in S3 are stored without the pool prefix
         if !local_snapshot_names.iter().any(|s| s.eq(object)) {
             log::info!("Deleting {object} from S3.");
-            s3.delete_object(object).await?;
+            if let Err(e) = s3.delete_object(object).await {
+                log::error!("Failed to delete snapshot {object} from S3: {}", e);
+            }
         }
     }
 

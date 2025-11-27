@@ -8,8 +8,8 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
-use zfs2s3::SnapshotType;
 use zfs2s3::config::Config;
+use zfs2s3::{SnapshotType, ensure_snapshots_for_volumes};
 
 #[derive(Parser)]
 #[command(name = env!("CARGO_PKG_NAME"))]
@@ -59,6 +59,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .await?
             .keep_volume_to_backup(&config);
 
+        if mode == SnapshotType::Incremental {
+            ensure_snapshots_for_volumes(&volumes_to_backup).await?;
+        }
+
         zfs2s3::snapshot_volumes(&volumes_to_backup, &mode).await?;
         volumes_to_backup.refresh().await?;
 
@@ -83,11 +87,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         signal_cancel_token.cancel();
     });
 
+    // Operation lock to prevent concurrent backups and cleanups
+    let op_lock = Arc::new(tokio::sync::Mutex::new(()));
+
     // Backup task
     let handle_full_backups = tokio::task::spawn(run_scheduled_backups(
         Arc::clone(&config),
         Arc::clone(&s3_client),
         cancel_token.clone(),
+        Arc::clone(&op_lock),
     ));
     handles.push(handle_full_backups);
 
@@ -97,6 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Arc::clone(&config),
             Arc::clone(&s3_client),
             cancel_token.clone(),
+            Arc::clone(&op_lock),
         )
     });
     handles.push(handle_cleanup);
@@ -127,6 +136,7 @@ async fn run_scheduled_backups(
     config: Arc<Config>,
     s3_client: Arc<zfs2s3::s3::S3Client>,
     cancel_token: CancellationToken,
+    op_lock: Arc<tokio::sync::Mutex<()>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Run both Full and Incremental schedules in the same task to avoid having
     // both schedules trigger backups at the same time.
@@ -161,10 +171,22 @@ async fn run_scheduled_backups(
             }
         }
 
+        // Acquire operation lock
+        let _lock = op_lock.lock().await;
+
         // Get volumes to back up
         let mut volumes = zfs2s3::zfs::VolumeSnapshotMap::new()
             .await?
             .keep_volume_to_backup(&config);
+
+        if snapshot_type == SnapshotType::Incremental {
+            // Ensure there is at least one snapshot for each volume to back up
+            // before performing incremental backup
+            if let Err(e) = ensure_snapshots_for_volumes(&volumes).await {
+                log::error!("Failed to ensure snapshots for incremental backup: {e}");
+                continue;
+            }
+        }
 
         // Perform backup
         if let Err(e) = zfs2s3::snapshot_volumes(&volumes, &snapshot_type).await {
@@ -190,6 +212,7 @@ async fn run_cleanup(
     config: Arc<Config>,
     s3_client: Arc<zfs2s3::s3::S3Client>,
     cancel_token: CancellationToken,
+    op_lock: Arc<tokio::sync::Mutex<()>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let schedule = config.cleanup.schedule()?;
     while !cancel_token.is_cancelled() {
@@ -197,7 +220,7 @@ async fn run_cleanup(
         let next = schedule
             .after(&now)
             .next()
-            .ok_or("No upcoming backup from schedule")?;
+            .ok_or("No upcoming cleanup from schedule")?;
         let duration = (next - now).to_std()?;
 
         select! {
@@ -206,6 +229,9 @@ async fn run_cleanup(
                 break;
             }
         }
+
+        // Acquire operation lock
+        let _lock = op_lock.lock().await;
 
         // Get volumes to back up
         let mut volumes = zfs2s3::zfs::VolumeSnapshotMap::new()
